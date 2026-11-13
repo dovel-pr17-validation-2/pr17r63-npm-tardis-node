@@ -1,0 +1,1162 @@
+import crypto, { createHash } from 'crypto'
+import { createReadStream, createWriteStream, mkdirSync, rmSync } from 'node:fs'
+import { rename } from 'node:fs/promises'
+import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from 'node:http'
+import { Agent as HttpsAgent, request as httpsRequest, type RequestOptions } from 'node:https'
+import { pipeline } from 'node:stream/promises'
+import path from 'path'
+import { debug } from './debug.ts'
+import { forEachConcurrent } from './foreachconcurrent.ts'
+import { Mapper } from './mappers/index.ts'
+import { Disconnect, Exchange, Filter, FilterForExchange } from './types.ts'
+
+export function parseAsUTCDate(val: string) {
+  // Treat date-only and minute-level strings as UTC instead of local time.
+  if (val.endsWith('Z') === false) {
+    val += 'Z'
+  }
+  const date = new Date(val)
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), date.getUTCHours(), date.getUTCMinutes()))
+}
+
+export function wait(delayMS: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, delayMS)
+  })
+}
+
+export function getRandomString() {
+  return crypto.randomBytes(24).toString('hex')
+}
+
+export function formatDateToPath(date: Date) {
+  const year = date.getUTCFullYear()
+  const month = doubleDigit(date.getUTCMonth() + 1)
+  const day = doubleDigit(date.getUTCDate())
+  const hour = doubleDigit(date.getUTCHours())
+  const minute = doubleDigit(date.getUTCMinutes())
+
+  return `${year}/${month}/${day}/${hour}/${minute}`
+}
+
+export function doubleDigit(input: number) {
+  return input < 10 ? '0' + input : '' + input
+}
+
+export function sha256(obj: object) {
+  return createHash('sha256').update(JSON.stringify(obj)).digest('hex')
+}
+
+export function addMinutes(date: Date, minutes: number) {
+  return new Date(date.getTime() + minutes * 60000)
+}
+
+export function addDays(date: Date, days: number) {
+  return new Date(date.getTime() + days * 60000 * 1440)
+}
+
+export function* sequence(end: number, seed = 0) {
+  let current = seed
+  while (current < end) {
+    yield current
+    current += 1
+  }
+
+  return
+}
+
+export const ONE_SEC_IN_MS = 1000
+
+export class HttpError extends Error {
+  public readonly retryAfterMS: number | undefined
+
+  constructor(
+    public readonly status: number,
+    public readonly responseText: string,
+    public readonly url: string,
+    headers: Record<string, string> = {}
+  ) {
+    super(`HttpError: status code: ${status}, response text: ${responseText}`)
+    this.retryAfterMS = getRetryAfterDelayMS(headers)
+  }
+}
+
+export class HttpClientError extends Error {
+  public readonly status: number
+  public readonly retryAfterMS: number | undefined
+
+  constructor(
+    public readonly response: HttpResponse,
+    public readonly method: string,
+    public readonly url: string
+  ) {
+    super(`HTTP ${method} ${url} failed with status ${response.statusCode}`)
+    this.status = response.statusCode
+    this.retryAfterMS = getRetryAfterDelayMS(response.headers)
+  }
+}
+
+export function* take(iterable: Iterable<any>, length: number) {
+  if (length === 0) {
+    return
+  }
+  for (const item of iterable) {
+    yield item
+    length--
+
+    if (length === 0) {
+      return
+    }
+  }
+}
+
+export async function* normalizeMessages(
+  exchange: Exchange,
+  symbols: string[] | undefined,
+  messages: AsyncIterableIterator<{ localTimestamp: Date; message: any } | undefined>,
+  mappers: Mapper<any, any>[],
+  createMappers: (localTimestamp: Date) => Mapper<any, any>[],
+  withDisconnectMessages: boolean | undefined,
+  filter?: (symbol: string) => boolean,
+  currentTimestamp?: Date | undefined
+) {
+  let previousLocalTimestamp: Date | undefined = currentTimestamp
+  let mappersForExchange: Mapper<any, any>[] | undefined = mappers
+  if (mappersForExchange.length === 0) {
+    throw new Error(`Can't normalize data without any normalizers provided`)
+  }
+
+  for await (const messageWithTimestamp of messages) {
+    if (messageWithTimestamp === undefined) {
+      // we received undefined meaning Websocket disconnection
+      // lets create new mappers with clean state for 'new connection'
+      mappersForExchange = undefined
+
+      // if flag withDisconnectMessages is set, yield disconnect message
+      if (withDisconnectMessages === true && previousLocalTimestamp !== undefined) {
+        const disconnect: Disconnect = {
+          type: 'disconnect',
+          exchange,
+          localTimestamp: previousLocalTimestamp,
+          symbols
+        }
+        yield disconnect as any
+      }
+
+      continue
+    }
+
+    if (mappersForExchange === undefined) {
+      mappersForExchange = createMappers(messageWithTimestamp.localTimestamp)
+    }
+
+    previousLocalTimestamp = messageWithTimestamp.localTimestamp
+
+    for (const mapper of mappersForExchange) {
+      if (mapper.canHandle(messageWithTimestamp.message)) {
+        const mappedMessages = mapper.map(messageWithTimestamp.message, messageWithTimestamp.localTimestamp)
+        if (!mappedMessages) {
+          continue
+        }
+
+        for (const message of mappedMessages) {
+          if (filter === undefined) {
+            yield message
+          } else if (filter(message.symbol)) {
+            yield message
+          }
+        }
+      }
+    }
+  }
+}
+
+export function getFilters<T extends Exchange>(mappers: Mapper<T, any>[], symbols?: string[]) {
+  const filters = mappers.flatMap((mapper) => mapper.getFilters(symbols))
+
+  const deduplicatedFilters = filters.reduce(
+    (prev, current) => {
+      const matchingExisting = prev.find((c) => c.channel === current.channel)
+      if (matchingExisting !== undefined) {
+        if (matchingExisting.symbols !== undefined && current.symbols) {
+          for (let symbol of current.symbols) {
+            if (matchingExisting.symbols.includes(symbol) === false) {
+              matchingExisting.symbols.push(symbol)
+            }
+          }
+        } else if (current.symbols) {
+          matchingExisting.symbols = [...current.symbols]
+        }
+      } else {
+        prev.push(current)
+      }
+
+      return prev
+    },
+    [] as FilterForExchange[T][]
+  )
+
+  return deduplicatedFilters
+}
+
+export function* batch(symbols: string[], batchSize: number) {
+  for (let i = 0; i < symbols.length; i += batchSize) {
+    yield symbols.slice(i, i + batchSize)
+  }
+}
+export function* batchObjects<T>(payload: T[], batchSize: number) {
+  for (let i = 0; i < payload.length; i += batchSize) {
+    yield payload.slice(i, i + batchSize)
+  }
+}
+
+export function parseμs(dateString: string): number {
+  if (dateString[19] !== '.') {
+    return 0
+  }
+
+  // ISO fractions may omit trailing zeros. Keep digits 4–6, padding shorter fractions and truncating finer precision.
+  let microseconds = 0
+  for (let index = 20, weight = 100; index < 26; index++) {
+    const digit = dateString.charCodeAt(index) - 48
+    if (!(digit >= 0 && digit <= 9)) {
+      break
+    }
+    if (index >= 23) {
+      microseconds += digit * weight
+      weight /= 10
+    }
+  }
+  return microseconds
+}
+
+export function parseISODateWithMicroseconds(value: string) {
+  const date = new Date(value)
+  date.μs = parseμs(value)
+  return date
+}
+
+export function optimizeFilters(filters: Filter<any>[]) {
+  // deduplicate filters (if the channel was provided multiple times)
+  const optimizedFilters = filters.reduce((prev, current) => {
+    const matchingExisting = prev.find((c) => c.channel === current.channel)
+
+    if (matchingExisting) {
+      // both previous and current have symbols let's merge them
+      if (matchingExisting.symbols && current.symbols) {
+        matchingExisting.symbols.push(...current.symbols)
+      } else if (current.symbols) {
+        matchingExisting.symbols = [...current.symbols]
+      }
+    } else {
+      prev.push(current)
+    }
+
+    return prev
+  }, [] as Filter<any>[])
+
+  // sort filters in place to improve local disk cache ratio (no matter filters order if the same filters are provided will hit the cache)
+  optimizedFilters.sort((f1, f2) => {
+    if (f1.channel < f2.channel) {
+      return -1
+    }
+
+    if (f1.channel > f2.channel) {
+      return 1
+    }
+
+    return 0
+  })
+
+  // sort and deduplicate filters symbols
+  optimizedFilters.forEach((filter) => {
+    if (filter.symbols) {
+      filter.symbols = [...new Set(filter.symbols)].sort()
+    }
+  })
+
+  return optimizedFilters
+}
+
+const httpsAgent = new HttpsAgent({
+  keepAlive: true,
+  keepAliveMsecs: 10 * ONE_SEC_IN_MS,
+  maxSockets: 120
+})
+
+const proxyEnv =
+  process.env.HTTP_PROXY === undefined
+    ? undefined
+    : {
+        HTTP_PROXY: process.env.HTTP_PROXY,
+        HTTPS_PROXY: process.env.HTTP_PROXY
+      }
+const httpProxyAgent = proxyEnv === undefined ? undefined : new HttpAgent({ proxyEnv })
+const httpsProxyAgent = proxyEnv === undefined ? undefined : new HttpsAgent({ proxyEnv })
+
+export function getProxyAgent(url: string | URL) {
+  const protocol = new URL(url).protocol
+  return protocol === 'http:' || protocol === 'ws:' ? httpProxyAgent : httpsProxyAgent
+}
+
+const DEFAULT_FETCH_RETRY_LIMIT = 2
+
+type HttpRetryOptions =
+  | number
+  | {
+      limit?: number
+      statusCodes?: number[]
+      maxRetryAfter?: number
+    }
+
+type HttpRequestOptions = {
+  headers?: Record<string, string>
+  body?: string | object
+  timeout?: number
+  retry?: HttpRetryOptions
+}
+
+type HttpResponse = {
+  statusCode: number
+  headers: Record<string, string>
+  body: string
+}
+
+type JSONResponse<T> = {
+  data: T
+  headers: Record<string, string>
+  statusCode: number
+}
+
+type RetrySettings = {
+  limit: number
+  maxRetryAfter?: number
+  statusCodes?: Set<number>
+}
+
+function getRetrySettings(method: string, retry?: HttpRetryOptions): RetrySettings {
+  const retryOptions = typeof retry === 'object' ? retry : undefined
+  const retryEnabled = method === 'GET' || retry !== undefined
+  const limit = typeof retry === 'number' ? retry : (retryOptions?.limit ?? (retryEnabled ? DEFAULT_FETCH_RETRY_LIMIT : 0))
+
+  return {
+    limit,
+    maxRetryAfter: retryOptions?.maxRetryAfter,
+    statusCodes: retryOptions?.statusCodes ? new Set(retryOptions.statusCodes) : undefined
+  }
+}
+
+function parseResponseHeaders(headers: Headers) {
+  return Object.fromEntries(headers.entries())
+}
+
+function parseNodeResponseHeaders(headers: Record<string, string | string[] | undefined>) {
+  return Object.fromEntries(
+    Object.entries(headers).flatMap(([key, value]) => {
+      if (value === undefined) {
+        return []
+      }
+
+      return [[key.toLowerCase(), Array.isArray(value) ? value.join(', ') : value]]
+    })
+  )
+}
+
+function createHttpResponse(statusCode: number, headers: Record<string, string>, body: string): HttpResponse {
+  return {
+    statusCode,
+    headers,
+    body
+  }
+}
+
+function prepareRequest(method: string, options: HttpRequestOptions) {
+  if (options.body === undefined) {
+    return {
+      headers: options.headers,
+      body: undefined
+    }
+  }
+
+  const headers = { ...options.headers }
+  const body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body)
+
+  if (method !== 'GET' && headers['Content-Type'] === undefined && headers['content-type'] === undefined) {
+    headers['Content-Type'] = 'application/json'
+  }
+
+  return {
+    headers,
+    body
+  }
+}
+
+function getRetryAfterDelayMS(headers: Record<string, string>, maxRetryAfter?: number) {
+  const retryAfterHeader = headers['retry-after']
+  if (retryAfterHeader === undefined) {
+    return
+  }
+
+  const parsedSeconds = Number.parseFloat(retryAfterHeader)
+  let delayMS: number | undefined
+
+  if (Number.isFinite(parsedSeconds)) {
+    delayMS = parsedSeconds * ONE_SEC_IN_MS
+  } else {
+    const parsedDate = Date.parse(retryAfterHeader)
+    if (Number.isFinite(parsedDate)) {
+      delayMS = parsedDate - Date.now()
+    }
+  }
+
+  if (delayMS === undefined || delayMS < 0) {
+    return
+  }
+
+  if (maxRetryAfter !== undefined && delayMS > maxRetryAfter) {
+    return
+  }
+
+  return delayMS
+}
+
+function getRetryDelayMS(attempt: number, headers: Record<string, string>, maxRetryAfter?: number) {
+  const retryAfterDelayMS = getRetryAfterDelayMS(headers, maxRetryAfter)
+  if (retryAfterDelayMS !== undefined) {
+    return retryAfterDelayMS
+  }
+
+  return Math.min(250 * 2 ** (attempt - 1), 5000)
+}
+
+function isRetryableStatus(statusCode: number, retrySettings: RetrySettings) {
+  if (retrySettings.statusCodes !== undefined) {
+    return retrySettings.statusCodes.has(statusCode)
+  }
+
+  return statusCode === 408 || statusCode === 429 || statusCode >= 500
+}
+
+function shouldRetryHttpStatus(attempt: number, response: HttpResponse, retrySettings: RetrySettings) {
+  return attempt <= retrySettings.limit && isRetryableStatus(response.statusCode, retrySettings)
+}
+
+function shouldRetryHttpError(attempt: number, retrySettings: RetrySettings) {
+  return attempt <= retrySettings.limit
+}
+
+async function requestViaFetch(method: string, url: string, options: HttpRequestOptions): Promise<HttpResponse> {
+  const controller = new AbortController()
+  const timeoutMS = options.timeout
+  const timeoutId = timeoutMS !== undefined ? setTimeout(() => controller.abort(), timeoutMS) : undefined
+  const preparedRequest = prepareRequest(method, options)
+
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: preparedRequest.headers,
+      body: preparedRequest.body,
+      signal: controller.signal
+    })
+    const body = await response.text()
+
+    return createHttpResponse(response.status, parseResponseHeaders(response.headers), body)
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error('Request timed out')
+    }
+
+    throw error
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId)
+    }
+  }
+}
+
+type DownloadRequestOptions = {
+  headers: Record<string, string>
+  timeout: number
+}
+
+function sendHttpRequest(url: string | URL, options: RequestOptions, body?: string): Promise<IncomingMessage> {
+  const requestUrl = new URL(url)
+  const requestClient = requestUrl.protocol === 'http:' ? httpRequest : httpsRequest
+  const agent = getProxyAgent(requestUrl) ?? (requestUrl.protocol === 'https:' ? httpsAgent : undefined)
+
+  return new Promise((resolve, reject) => {
+    const request = requestClient(requestUrl, { ...options, agent }, resolve)
+
+    request.once('error', reject)
+    request.once('timeout', () => request.destroy(new Error('Request timed out')))
+    if (body !== undefined) {
+      request.write(body)
+    }
+    request.end()
+  })
+}
+
+async function openDownloadResponse(url: string, options: DownloadRequestOptions) {
+  const response = await sendHttpRequest(url, options)
+  const statusCode = response.statusCode ?? 0
+  const location = response.headers.location
+  if (location === undefined || statusCode < 300 || statusCode >= 400) {
+    return { response }
+  }
+
+  response.destroy()
+  const sourceUrl = new URL(url)
+  const redirectUrl = new URL(location, sourceUrl)
+  const headers: Record<string, string> = { ...options.headers }
+  if (sourceUrl.origin !== redirectUrl.origin) {
+    delete headers.Authorization
+    delete headers.authorization
+  }
+
+  return {
+    response: await sendHttpRequest(redirectUrl, {
+      ...options,
+      headers
+    }),
+    redirectUrl: redirectUrl.toString()
+  }
+}
+
+async function readResponseText(response: IncomingMessage) {
+  response.setEncoding('utf8')
+  let body = ''
+  for await (const chunk of response) {
+    body += chunk
+  }
+  return body
+}
+
+async function requestViaProxy(method: string, url: string, options: HttpRequestOptions): Promise<HttpResponse> {
+  const preparedRequest = prepareRequest(method, options)
+  const response = await sendHttpRequest(
+    url,
+    {
+      method,
+      headers: preparedRequest.headers,
+      timeout: options.timeout
+    },
+    preparedRequest.body
+  )
+
+  return createHttpResponse(response.statusCode ?? 0, parseNodeResponseHeaders(response.headers), await readResponseText(response))
+}
+
+async function request(method: string, url: string, options: HttpRequestOptions = {}) {
+  const retrySettings = getRetrySettings(method, options.retry)
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const response =
+        getProxyAgent(url) === undefined ? await requestViaFetch(method, url, options) : await requestViaProxy(method, url, options)
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return response
+      }
+
+      if (shouldRetryHttpStatus(attempt, response, retrySettings)) {
+        await wait(getRetryDelayMS(attempt, response.headers, retrySettings.maxRetryAfter))
+        continue
+      }
+
+      throw new HttpClientError(response, method, url)
+    } catch (error) {
+      if (error instanceof HttpClientError) {
+        throw error
+      }
+
+      if (shouldRetryHttpError(attempt, retrySettings)) {
+        await wait(Math.min(250 * 2 ** (attempt - 1), 5000))
+        continue
+      }
+
+      throw error
+    }
+  }
+}
+
+async function requestJSON<T>(method: string, url: string, options?: HttpRequestOptions): Promise<JSONResponse<T>> {
+  const response = await request(method, url, options)
+
+  return {
+    data: JSON.parse(response.body) as T,
+    headers: response.headers,
+    statusCode: response.statusCode
+  }
+}
+
+export function getJSON<T>(url: string, options?: HttpRequestOptions) {
+  return requestJSON<T>('GET', url, options)
+}
+
+export function postJSON<T>(url: string, options?: HttpRequestOptions) {
+  return requestJSON<T>('POST', url, options)
+}
+
+export async function download({
+  apiKey,
+  downloadPath,
+  url,
+  userAgent,
+  appendContentEncodingExtension = false,
+  acceptEncoding = 'gzip',
+  attemptTimeoutMS = 90 * ONE_SEC_IN_MS
+}: {
+  url: string
+  downloadPath: string
+  userAgent: string
+  apiKey: string
+  appendContentEncodingExtension?: boolean
+  acceptEncoding?: string
+  attemptTimeoutMS?: number
+}) {
+  const httpRequestOptions = {
+    timeout: attemptTimeoutMS,
+    headers: {
+      'Accept-Encoding': acceptEncoding,
+      'User-Agent': userAgent,
+      Authorization: apiKey ? `Bearer ${apiKey}` : ''
+    }
+  }
+
+  return withDownloadRetries(url, downloadPath, (attemptUrl) =>
+    _downloadFile(httpRequestOptions, attemptUrl, downloadPath, appendContentEncodingExtension)
+  )
+}
+
+async function withDownloadRetries<T>(url: string, downloadPath: string, attempt: (attemptUrl: string) => Promise<T>) {
+  const MAX_ATTEMPTS = 30
+  const MAX_RETRY_AFTER_MS = 300 * ONE_SEC_IN_MS
+  let attempts = 0
+
+  while (true) {
+    // simple retry logic when fetching from the network...
+    attempts++
+    try {
+      const addRetryAttempt = attempts - 1 > 0 && url.endsWith('gz')
+      return await attempt(addRetryAttempt ? `${url}?retryAttempt=${attempts - 1}` : url)
+    } catch (error) {
+      const unsupportedDataFeedEncoding = error instanceof Error && error.message.startsWith('Unsupported data feed content encoding')
+      const nonRetryableHttpError =
+        error instanceof HttpError &&
+        ((error.status === 400 && error.message.includes('ISO 8601 format') === false) ||
+          error.status === 401 ||
+          error.status === 403 ||
+          error.status === 404 ||
+          error.status === 416)
+      const tooManyRequests = error instanceof HttpError && error.status === 429
+      const retryAfterMS = tooManyRequests ? error.retryAfterMS : undefined
+      const retryAfterTooLong = retryAfterMS !== undefined && retryAfterMS > MAX_RETRY_AFTER_MS
+      const internalServiceError = error instanceof HttpError && error.status === 500
+      // do not retry when we've got bad or unauthorized request, too long Retry-After or enough attempts
+      if (
+        unsupportedDataFeedEncoding ||
+        error instanceof DatasetMismatchError ||
+        nonRetryableHttpError ||
+        retryAfterTooLong ||
+        attempts === MAX_ATTEMPTS
+      ) {
+        throw error
+      }
+
+      const randomIngridient = Math.random() * 500
+      const attemptsDelayMS = Math.min(Math.pow(2, attempts) * ONE_SEC_IN_MS, 120 * ONE_SEC_IN_MS)
+      let nextAttemptDelayMS = randomIngridient + attemptsDelayMS
+
+      if (retryAfterMS !== undefined) {
+        // wait as long as the API asked, with jitter so concurrent downloads do not retry at the same time
+        nextAttemptDelayMS = retryAfterMS + Math.random() * ONE_SEC_IN_MS
+      } else if (tooManyRequests) {
+        // when too many requests received without Retry-After wait one minute
+        nextAttemptDelayMS += 60 * ONE_SEC_IN_MS
+      }
+      if (internalServiceError) {
+        nextAttemptDelayMS = nextAttemptDelayMS * 2
+      }
+
+      debug('download file error: %o, next attempt delay: %d, url %s, path: %s', error, nextAttemptDelayMS, url, downloadPath)
+
+      await wait(nextAttemptDelayMS)
+    }
+  }
+}
+
+const tmpFileCleanups = new Map<string, () => void>()
+
+export function cleanTempFiles() {
+  tmpFileCleanups.forEach((cleanup) => cleanup())
+}
+
+async function _downloadFile(
+  requestOptions: DownloadRequestOptions,
+  url: string,
+  downloadPath: string,
+  appendContentEncodingExtension: boolean
+) {
+  // first ensure that directory where we want to download file exists
+  mkdirSync(path.dirname(downloadPath), { recursive: true })
+
+  // create write file stream that we'll write data into - first as unconfirmed temp file
+
+  const tmpFilePath = `${downloadPath}${crypto.randomBytes(8).toString('hex')}.unconfirmed`
+  let fileWriteStream: ReturnType<typeof createWriteStream> | undefined
+  const cleanup = () => {
+    try {
+      fileWriteStream?.destroy()
+      rmSync(tmpFilePath, { force: true })
+    } catch {}
+  }
+  tmpFileCleanups.set(tmpFilePath, cleanup)
+
+  let finalDownloadPath = downloadPath
+
+  try {
+    // based on https://github.com/nodejs/node/issues/28172 - only reliable way to consume response stream and avoiding all the 'gotchas'
+    const { response } = await openDownloadResponse(url, requestOptions)
+    const { statusCode } = response
+    const responseHeaders = parseNodeResponseHeaders(response.headers)
+    if (statusCode !== 200) {
+      throw new HttpError(statusCode ?? 0, await readResponseText(response), url, responseHeaders)
+    }
+
+    if (appendContentEncodingExtension) {
+      const contentEncoding = asSingleHeaderValue(response.headers['content-encoding'])
+      if (contentEncoding === 'zstd') {
+        finalDownloadPath = `${downloadPath}.zst`
+      } else if (contentEncoding === undefined || contentEncoding === 'gzip') {
+        finalDownloadPath = `${downloadPath}.gz`
+      } else {
+        throw new Error(`Unsupported data feed content encoding: ${contentEncoding}`)
+      }
+    }
+
+    fileWriteStream = createWriteStream(tmpFilePath)
+    await pipeline(response, fileWriteStream)
+    if (!response.complete) {
+      throw new Error('The connection was terminated while the message was still being sent')
+    }
+
+    // finally when saving from the network to file has succeded, rename tmp file to normal name
+    // then we're sure that responses is 100% saved and also even if different process was doing the same we're good
+    await rename(tmpFilePath, finalDownloadPath)
+
+    return {
+      downloadPath: finalDownloadPath,
+      headers: responseHeaders
+    }
+  } finally {
+    tmpFileCleanups.delete(tmpFilePath)
+    cleanup()
+  }
+}
+
+const DATASET_RANGE_SIZE = 64 * 1024 * 1024
+// A dataset is rarely exported again while it downloads, so repeated mismatches mean another restart won't help.
+const MAX_DATASET_RESTARTS = 3
+
+// The downloaded ranges don't make up one dataset file, because it was exported again during the download or doesn't
+// match its announced MD5, so the download starts over.
+class DatasetMismatchError extends Error {}
+
+// One pool for all files and ranges of a download, so splitting files into ranges does not add connections.
+export class RequestSlots {
+  private active = 0
+  private readonly waiting: (() => void)[] = []
+
+  constructor(readonly limit: number) {}
+
+  async run<T>(request: () => Promise<T>) {
+    if (this.active < this.limit) {
+      this.active++
+    } else {
+      await new Promise<void>((resolve) => this.waiting.push(resolve))
+    }
+
+    try {
+      return await request()
+    } finally {
+      const next = this.waiting.shift()
+      if (next === undefined) {
+        this.active--
+      } else {
+        next()
+      }
+    }
+  }
+}
+
+// Downloads byte ranges in parallel into one temp file, and a failed range retries alone.
+export async function downloadDatasetFile({
+  apiKey,
+  downloadPath,
+  url,
+  userAgent,
+  attemptTimeoutMS,
+  verifyMd5,
+  requestSlots
+}: {
+  url: string
+  downloadPath: string
+  userAgent: string
+  apiKey: string
+  attemptTimeoutMS: number
+  verifyMd5: boolean
+  requestSlots: RequestSlots
+}) {
+  // The API key goes only to the API, never to the storage the API redirects to.
+  const storageRequestOptions = {
+    timeout: attemptTimeoutMS,
+    headers: {
+      'Accept-Encoding': 'gzip',
+      'User-Agent': userAgent
+    }
+  }
+  const apiRequestOptions = {
+    ...storageRequestOptions,
+    headers: { ...storageRequestOptions.headers, Authorization: apiKey ? `Bearer ${apiKey}` : '' }
+  }
+
+  mkdirSync(path.dirname(downloadPath), { recursive: true })
+  const tmpFilePath = `${downloadPath}${crypto.randomBytes(8).toString('hex')}.unconfirmed`
+  const cleanup = () => {
+    try {
+      rmSync(tmpFilePath, { force: true })
+    } catch {}
+  }
+  tmpFileCleanups.set(tmpFilePath, cleanup)
+
+  try {
+    for (let restarts = 0; ; restarts++) {
+      try {
+        const announcedMd5 = await downloadDatasetRanges(url, apiRequestOptions, storageRequestOptions, tmpFilePath, requestSlots)
+        if (verifyMd5) {
+          await checkDatasetMd5(tmpFilePath, announcedMd5, url)
+        }
+        break
+      } catch (error) {
+        if (!(error instanceof DatasetMismatchError) || restarts === MAX_DATASET_RESTARTS) {
+          throw error
+        }
+      }
+    }
+
+    await rename(tmpFilePath, downloadPath)
+  } finally {
+    tmpFileCleanups.delete(tmpFilePath)
+    cleanup()
+  }
+}
+
+async function downloadDatasetRanges(
+  url: string,
+  apiRequestOptions: DownloadRequestOptions,
+  storageRequestOptions: DownloadRequestOptions,
+  tmpFilePath: string,
+  requestSlots: RequestSlots
+) {
+  const first = await withDownloadRetries(url, tmpFilePath, (attemptUrl) =>
+    requestSlots.run(() => downloadDatasetRange(attemptUrl, apiRequestOptions, tmpFilePath, 0))
+  )
+  const datasetSize = first.datasetSize
+  if (datasetSize === undefined || datasetSize <= DATASET_RANGE_SIZE) {
+    return first.md5
+  }
+
+  // A low-cost account gets a storage redirect that stays valid for two hours, and every redirect counts the whole
+  // dataset toward its transfer limit, so the remaining ranges reuse it and only an expired one is renewed.
+  let storageUrl = first.redirectUrl
+  let renewal: ReturnType<typeof downloadDatasetRange> | undefined
+
+  const downloadRemainingRange = async (attemptUrl: string, start: number) => {
+    // Read the URL only once the range has a slot, so a range that waited long uses the newest URL.
+    const rangeUrl = storageUrl
+    if (rangeUrl === undefined) {
+      return downloadDatasetRange(attemptUrl, apiRequestOptions, tmpFilePath, start, datasetSize, first.md5)
+    }
+
+    try {
+      return await downloadDatasetRange(rangeUrl, storageRequestOptions, tmpFilePath, start, datasetSize, first.md5)
+    } catch (error) {
+      if (!(error instanceof HttpError && error.status === 403)) {
+        throw error
+      }
+      // The first range to find the URL expired downloads through the API again, like the first range, and the
+      // redirect it gets replaces the URL. The others wait for it and retry with the new URL, or fail this attempt
+      // with its error.
+      if (renewal === undefined && storageUrl === rangeUrl) {
+        renewal = downloadDatasetRange(attemptUrl, apiRequestOptions, tmpFilePath, start, datasetSize, first.md5)
+          .then((renewedRange) => {
+            storageUrl = renewedRange.redirectUrl
+            return renewedRange
+          })
+          .finally(() => {
+            renewal = undefined
+          })
+        return await renewal
+      }
+      await renewal
+      throw new Error('Dataset redirect expired')
+    }
+  }
+
+  const rangeStarts = [...sequence(Math.ceil(datasetSize / DATASET_RANGE_SIZE), 1)].map((index) => index * DATASET_RANGE_SIZE)
+  // Unlike Promise.all, forEachConcurrent rejects only after the ranges already started have finished, retries included,
+  // so a restart or cleanup never overlaps a range still writing.
+  await forEachConcurrent(rangeStarts, requestSlots.limit, (start) =>
+    withDownloadRetries(url, tmpFilePath, (attemptUrl) => requestSlots.run(() => downloadRemainingRange(attemptUrl, start)))
+  )
+
+  return first.md5
+}
+
+async function downloadDatasetRange(
+  url: string,
+  requestOptions: DownloadRequestOptions,
+  tmpFilePath: string,
+  start: number,
+  expectedDatasetSize?: number,
+  expectedMd5?: string
+) {
+  const end = start + DATASET_RANGE_SIZE - 1
+  const { response, redirectUrl } = await openDownloadResponse(url, {
+    ...requestOptions,
+    headers: { ...requestOptions.headers, Range: `bytes=${start}-${end}` }
+  })
+  const statusCode = response.statusCode ?? 0
+  // A later range that comes back whole or out of bounds belongs to a dataset exported again with another size.
+  if (start > 0 && (statusCode === 200 || statusCode === 416)) {
+    response.destroy()
+    throw new DatasetMismatchError(`Dataset changed during download: bytes=${start}-${end} returned ${statusCode}`)
+  }
+  // 200 means the storage ignored the range and sends the whole dataset.
+  if (statusCode !== 206 && statusCode !== 200) {
+    throw new HttpError(statusCode, await readResponseText(response), url, parseNodeResponseHeaders(response.headers))
+  }
+
+  let datasetSize: number | undefined
+  if (statusCode === 206) {
+    const contentRange = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(asSingleHeaderValue(response.headers['content-range']) ?? '')
+    datasetSize = Number(contentRange?.[3])
+    if (contentRange === null || Number(contentRange[1]) !== start || Number(contentRange[2]) !== Math.min(end, datasetSize - 1)) {
+      response.destroy()
+      throw new Error(`Unexpected Content-Range for bytes=${start}-${end}: ${response.headers['content-range']}`)
+    }
+    if (expectedDatasetSize !== undefined && datasetSize !== expectedDatasetSize) {
+      response.destroy()
+      throw new DatasetMismatchError(`Dataset size changed from ${expectedDatasetSize} to ${datasetSize} bytes during download`)
+    }
+  }
+  // A dataset exported again with the same size announces another MD5.
+  const md5 = getAnnouncedMd5(parseNodeResponseHeaders(response.headers))
+  if (expectedMd5 !== undefined && md5 !== undefined && md5 !== expectedMd5) {
+    response.destroy()
+    throw new DatasetMismatchError(`Dataset MD5 changed from ${expectedMd5} to ${md5} during download`)
+  }
+
+  await pipeline(response, createWriteStream(tmpFilePath, { flags: start === 0 ? 'w' : 'r+', start }))
+  if (!response.complete) {
+    throw new Error('The connection was terminated while the message was still being sent')
+  }
+
+  return { datasetSize, redirectUrl, md5 }
+}
+
+// Ranges are written in parallel, so the MD5 is computed from the finished file.
+async function checkDatasetMd5(tmpFilePath: string, announcedMd5: string | undefined, url: string) {
+  if (announcedMd5 === undefined) {
+    return
+  }
+
+  const md5 = createHash('md5')
+  for await (const chunk of createReadStream(tmpFilePath)) {
+    md5.update(chunk)
+  }
+  const actualMd5 = md5.digest('hex')
+  if (actualMd5 !== announcedMd5) {
+    throw new DatasetMismatchError(`MD5 mismatch for ${url}: expected ${announcedMd5}, got ${actualMd5}`)
+  }
+}
+
+// The API sends x-md5, while a redirect to the storage returns the storage's x-amz-meta-md5 and ETag.
+// A multipart ETag ("<hash>-<parts>") is not the file MD5, so such a file is saved without a check.
+function getAnnouncedMd5(headers: Record<string, string>) {
+  const md5 = (headers['x-md5'] ?? headers['x-amz-meta-md5'] ?? headers['etag'] ?? '').replace(/"/g, '').toLowerCase()
+  return /^[0-9a-f]{32}$/.test(md5) ? md5 : undefined
+}
+
+function asSingleHeaderValue(headerValue: string | string[] | undefined) {
+  if (Array.isArray(headerValue)) {
+    return headerValue[0]
+  }
+
+  return headerValue
+}
+
+export class CircularBuffer<T> {
+  private _buffer: T[] = []
+  private _index: number = 0
+  constructor(private readonly _bufferSize: number) {}
+
+  append(value: T) {
+    const isFull = this._buffer.length === this._bufferSize
+    let poppedValue
+    if (isFull) {
+      poppedValue = this._buffer[this._index]
+    }
+    this._buffer[this._index] = value
+    this._index = (this._index + 1) % this._bufferSize
+
+    return poppedValue
+  }
+
+  *items() {
+    for (let i = 0; i < this._buffer.length; i++) {
+      const index = (this._index + i) % this._buffer.length
+      yield this._buffer[index]
+    }
+  }
+
+  get count() {
+    return this._buffer.length
+  }
+
+  clear() {
+    this._buffer = []
+    this._index = 0
+  }
+}
+
+export class CappedSet<T> {
+  private _set = new Set<T>()
+  constructor(private readonly _maxSize: number) {}
+
+  public has(value: T) {
+    return this._set.has(value)
+  }
+
+  public add(value: T) {
+    if (this._set.size >= this._maxSize) {
+      this._set.delete(this._set.keys().next().value!)
+    }
+    this._set.add(value)
+  }
+
+  public remove(value: T) {
+    this._set.delete(value)
+  }
+
+  public size() {
+    return this._set.size
+  }
+}
+
+function hasFraction(n: number) {
+  return Math.abs(Math.round(n) - n) > 1e-10
+}
+// https://stackoverflow.com/a/44815797
+export function decimalPlaces(n: number) {
+  let count = 0
+  // multiply by increasing powers of 10 until the fractional part is ~ 0
+  while (hasFraction(n * 10 ** count) && isFinite(10 ** count)) count++
+  return count
+}
+
+/**
+ * Parses optional numeric fields where:
+ * * `0` **is valid and preserved**
+ * * `undefined`, `null`, `NaN`, `Infinity`, and `-Infinity` are treated as not valid and mapped to `undefined`
+ *
+ * Use for nullable/optional numeric fields such as open interest, funding rates, and greeks.
+ */
+export function asNumberOrUndefined(val: string | number | undefined | null) {
+  if (val === undefined || val === null || val === '') {
+    return
+  }
+
+  if (typeof val === 'number') {
+    return Number.isFinite(val) ? val : undefined
+  }
+
+  const asNumber = Number(val)
+  return Number.isFinite(asNumber) ? asNumber : undefined
+}
+
+/**
+ * Parses optional numeric fields where:
+ * * `0`, `undefined`, `null`, `NaN`, `Infinity`, and `-Infinity` are treated as not valid and mapped to `undefined`.
+ *
+ * Use for empty quote/top-of-book values that exchanges encode as zero.
+ */
+export function asNonZeroNumberOrUndefined(val: string | number | undefined | null) {
+  if (val === undefined || val === null || val === '' || val === 0) {
+    return
+  }
+
+  if (typeof val === 'number') {
+    return Number.isFinite(val) ? val : undefined
+  }
+
+  const asNumber = Number(val)
+  return Number.isFinite(asNumber) && asNumber !== 0 ? asNumber : undefined
+}
+
+export function isNullOrEmptyArray(array: readonly unknown[] | null | undefined) {
+  return !array?.length
+}
+
+export function upperCaseSymbols(symbols?: string[]) {
+  if (symbols !== undefined) {
+    return symbols.map((s) => s.toUpperCase())
+  }
+  return
+}
+
+export function createNormalizedSymbolFilter(symbols: string[] | undefined, filters: Filter<any>[]) {
+  if (symbols === undefined || symbols.length === 0) {
+    return
+  }
+
+  const allowedSymbols = new Set<string>()
+  for (const symbol of symbols) {
+    allowedSymbols.add(symbol)
+    allowedSymbols.add(symbol.toUpperCase())
+  }
+
+  for (const filter of filters) {
+    if (filter.symbols !== undefined) {
+      for (const symbol of filter.symbols) {
+        allowedSymbols.add(symbol)
+      }
+    }
+  }
+
+  return (symbol: string) => allowedSymbols.has(symbol)
+}
+
+export function lowerCaseSymbols(symbols?: string[]) {
+  if (symbols !== undefined) {
+    return symbols.map((s) => s.toLowerCase())
+  }
+  return
+}
+
+export const fromMicroSecondsToDate = (micros: number) => {
+  const isMicroseconds = micros > 1e15 // Check if the number is likely in microseconds
+
+  if (!isMicroseconds) {
+    return new Date(micros)
+  }
+
+  const timestamp = new Date(micros / 1000)
+  timestamp.μs = micros % 1000
+
+  return timestamp
+}
+
+export function onlyUnique(value: string, index: number, array: string[]) {
+  return array.indexOf(value) === index
+}

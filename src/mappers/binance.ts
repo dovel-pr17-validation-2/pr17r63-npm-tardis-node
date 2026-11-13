@@ -1,0 +1,600 @@
+import { debug } from '../debug.ts'
+import { CircularBuffer, fromMicroSecondsToDate, lowerCaseSymbols } from '../handy.ts'
+import { BookChange, BookTicker, DerivativeTicker, Exchange, FilterForExchange, Liquidation, Trade } from '../types.ts'
+import { Mapper, PendingTickerInfoHelper } from './mapper.ts'
+import { exchangeMappers, isRealTime } from './registry.ts'
+
+// https://github.com/binance-exchange/binance-official-api-docs/blob/master/web-socket-streams.md
+
+export const binanceMappers = exchangeMappers({
+  binance: {
+    trades: () => new BinanceTradesMapper('binance'),
+    bookChanges: (localTimestamp) =>
+      new BinanceBookChangeMapper('binance', { ignoreBookSnapshotOverlapError: shouldIgnoreBookSnapshotOverlap(localTimestamp) }),
+    bookTickers: () => new BinanceBookTickerMapper('binance')
+  },
+  'binance-us': {
+    trades: () => new BinanceTradesMapper('binance-us'),
+    bookChanges: (localTimestamp) =>
+      new BinanceBookChangeMapper('binance-us', { ignoreBookSnapshotOverlapError: shouldIgnoreBookSnapshotOverlap(localTimestamp) }),
+    bookTickers: () => new BinanceBookTickerMapper('binance-us')
+  },
+  'binance-jersey': {
+    trades: () => new BinanceTradesMapper('binance-jersey'),
+    bookChanges: (localTimestamp) =>
+      new BinanceBookChangeMapper('binance-jersey', { ignoreBookSnapshotOverlapError: shouldIgnoreBookSnapshotOverlap(localTimestamp) })
+  },
+  'binance-futures': {
+    trades: () => new BinanceTradesMapper('binance-futures'),
+    bookChanges: (localTimestamp) =>
+      new BinanceFuturesBookChangeMapper('binance-futures', {
+        ignoreBookSnapshotOverlapError: shouldIgnoreBookSnapshotOverlap(localTimestamp)
+      }),
+    derivativeTickers: () => new BinanceFuturesDerivativeTickerMapper('binance-futures'),
+    liquidations: () => new BinanceLiquidationsMapper('binance-futures'),
+    bookTickers: () => new BinanceBookTickerMapper('binance-futures')
+  },
+  'binance-delivery': {
+    trades: () => new BinanceTradesMapper('binance-delivery'),
+    bookChanges: (localTimestamp) =>
+      new BinanceFuturesBookChangeMapper('binance-delivery', {
+        ignoreBookSnapshotOverlapError: shouldIgnoreBookSnapshotOverlap(localTimestamp)
+      }),
+    derivativeTickers: () => new BinanceFuturesDerivativeTickerMapper('binance-delivery'),
+    liquidations: () => new BinanceLiquidationsMapper('binance-delivery'),
+    bookTickers: () => new BinanceBookTickerMapper('binance-delivery')
+  }
+})
+
+function shouldIgnoreBookSnapshotOverlap(date?: Date) {
+  if (process.env.IGNORE_BOOK_SNAPSHOT_OVERLAP_ERROR) {
+    return true
+  }
+
+  return isRealTime(date) === false
+}
+
+class BinanceTradesMapper implements Mapper<'binance' | 'binance-jersey' | 'binance-us' | 'binance-futures' | 'binance-delivery', Trade> {
+  constructor(private readonly _exchange: Exchange) {}
+
+  canHandle(message: BinanceResponse<any>) {
+    if (message.stream === undefined) {
+      return false
+    }
+
+    return message.stream.endsWith('@trade')
+  }
+
+  getFilters(symbols?: string[]) {
+    symbols = lowerCaseSymbols(symbols)
+
+    return [
+      {
+        channel: 'trade',
+        symbols
+      } as const
+    ]
+  }
+
+  *map(binanceTradeResponse: BinanceResponse<BinanceTradeData>, localTimestamp: Date) {
+    const binanceTrade = binanceTradeResponse.data
+
+    const isOffBookTrade = binanceTrade.X === 'INSURANCE_FUND' || binanceTrade.X === 'ADL' || binanceTrade.X === 'NA'
+    if (isOffBookTrade) {
+      return
+    }
+
+    const trade: Trade = {
+      type: 'trade',
+      symbol: binanceTrade.s,
+      exchange: this._exchange,
+      id: String(binanceTrade.t),
+      price: Number(binanceTrade.p),
+      amount: Number(binanceTrade.q),
+      side: binanceTrade.m ? 'sell' : 'buy',
+      timestamp: fromMicroSecondsToDate(binanceTrade.T),
+      localTimestamp: localTimestamp
+    }
+
+    yield trade
+  }
+}
+
+class BinanceBookChangeMapper implements Mapper<
+  'binance' | 'binance-jersey' | 'binance-us' | 'binance-futures' | 'binance-delivery',
+  BookChange
+> {
+  protected readonly symbolToDepthInfoMapping: {
+    [key: string]: LocalDepthInfo
+  } = {}
+
+  constructor(
+    protected readonly exchange: Exchange,
+    { ignoreBookSnapshotOverlapError }: { ignoreBookSnapshotOverlapError: boolean }
+  ) {
+    this.ignoreBookSnapshotOverlapError = ignoreBookSnapshotOverlapError
+  }
+
+  protected readonly ignoreBookSnapshotOverlapError: boolean
+
+  canHandle(message: BinanceResponse<any>) {
+    if (message.stream === undefined) {
+      return false
+    }
+
+    return message.stream.includes('@depth')
+  }
+
+  getFilters(symbols?: string[]) {
+    symbols = lowerCaseSymbols(symbols)
+
+    return [
+      {
+        channel: 'depth',
+        symbols
+      } as const,
+      {
+        channel: 'depthSnapshot',
+        symbols
+      } as const
+    ]
+  }
+
+  *map(message: BinanceResponse<BinanceDepthData | BinanceDepthSnapshotData>, localTimestamp: Date) {
+    const symbol = message.stream.split('@')[0].toUpperCase()
+
+    if (this.symbolToDepthInfoMapping[symbol] === undefined) {
+      this.symbolToDepthInfoMapping[symbol] = {
+        bufferedUpdates: new CircularBuffer<BinanceDepthData>(2000)
+      }
+    }
+
+    const symbolDepthInfo = this.symbolToDepthInfoMapping[symbol]
+    const snapshotAlreadyProcessed = symbolDepthInfo.snapshotProcessed
+
+    // first check if received message is snapshot and process it as such if it is
+    if (message.data.lastUpdateId !== undefined) {
+      // if we've already received 'manual' snapshot, ignore if there is another one
+      if (snapshotAlreadyProcessed) {
+        return
+      }
+      // produce snapshot book_change
+      const binanceDepthSnapshotData = message.data
+
+      //  mark given symbol depth info that has snapshot processed
+      symbolDepthInfo.lastUpdateId = binanceDepthSnapshotData.lastUpdateId
+      symbolDepthInfo.snapshotProcessed = true
+      const bidsByPrice = new Map(binanceDepthSnapshotData.bids.map((level) => [level[0], level]))
+      const asksByPrice = new Map(binanceDepthSnapshotData.asks.map((level) => [level[0], level]))
+
+      // if there were any depth updates buffered, let's proccess those by adding to or updating the initial snapshot
+      for (const update of symbolDepthInfo.bufferedUpdates.items()) {
+        const bookChange = this.mapBookDepthUpdate(update, localTimestamp)
+        if (bookChange !== undefined) {
+          this.applyLevelUpdates(bidsByPrice, update.b)
+          this.applyLevelUpdates(asksByPrice, update.a)
+        }
+      }
+
+      // remove all buffered updates
+      symbolDepthInfo.bufferedUpdates.clear()
+
+      const bookChange: BookChange = {
+        type: 'book_change',
+        symbol,
+        exchange: this.exchange,
+        isSnapshot: true,
+        bids: [...bidsByPrice.values()].map(this.mapBookLevel),
+        asks: [...asksByPrice.values()].map(this.mapBookLevel),
+        timestamp: binanceDepthSnapshotData.T !== undefined ? fromMicroSecondsToDate(binanceDepthSnapshotData.T) : localTimestamp,
+        localTimestamp
+      }
+
+      yield bookChange
+    } else if (snapshotAlreadyProcessed) {
+      // snapshot was already processed let's map the message as normal book_change
+      const bookChange = this.mapBookDepthUpdate(message.data as BinanceDepthData, localTimestamp)
+      if (bookChange !== undefined) {
+        yield bookChange
+      }
+    } else {
+      const binanceDepthUpdateData = message.data as BinanceDepthData
+
+      symbolDepthInfo.bufferedUpdates.append(binanceDepthUpdateData)
+    }
+  }
+
+  protected mapBookDepthUpdate(binanceDepthUpdateData: BinanceDepthData, localTimestamp: Date): BookChange | undefined {
+    // we can safely assume here that depthContext and lastUpdateId aren't null here as this is method only works
+    // when we've already processed the snapshot
+    const depthContext = this.symbolToDepthInfoMapping[binanceDepthUpdateData.s]!
+    const lastUpdateId = depthContext.lastUpdateId!
+
+    // Drop any event where u is <= lastUpdateId in the snapshot
+    if (binanceDepthUpdateData.u <= lastUpdateId) {
+      return
+    }
+
+    // The first processed event should have U <= lastUpdateId+1 AND u >= lastUpdateId+1.
+    if (!depthContext.validatedFirstUpdate) {
+      // if there is new instrument added it can have empty book at first and that's normal
+      const bookSnapshotIsEmpty = lastUpdateId == -1
+
+      if ((binanceDepthUpdateData.U <= lastUpdateId + 1 && binanceDepthUpdateData.u >= lastUpdateId + 1) || bookSnapshotIsEmpty) {
+        depthContext.validatedFirstUpdate = true
+      } else {
+        const message = `Book depth snaphot has no overlap with first update, update ${JSON.stringify(
+          binanceDepthUpdateData
+        )}, lastUpdateId: ${lastUpdateId}, exchange ${this.exchange}`
+        if (this.ignoreBookSnapshotOverlapError) {
+          depthContext.validatedFirstUpdate = true
+          debug(message)
+        } else {
+          throw new Error(message)
+        }
+      }
+    }
+
+    return {
+      type: 'book_change',
+      symbol: binanceDepthUpdateData.s,
+      exchange: this.exchange,
+      isSnapshot: false,
+
+      bids: binanceDepthUpdateData.b.map(this.mapBookLevel),
+      asks: binanceDepthUpdateData.a.map(this.mapBookLevel),
+      timestamp: fromMicroSecondsToDate(binanceDepthUpdateData.E),
+      localTimestamp: localTimestamp
+    }
+  }
+
+  protected mapBookLevel(level: BinanceBookLevel) {
+    const price = Number(level[0])
+    const amount = Number(level[1])
+    return { price, amount }
+  }
+
+  private applyLevelUpdates(levelsByPrice: Map<string, BinanceBookLevel>, updates: BinanceBookLevel[]) {
+    for (const level of updates) {
+      if (Number(level[1]) === 0) {
+        levelsByPrice.delete(level[0])
+      } else {
+        levelsByPrice.set(level[0], level)
+      }
+    }
+  }
+}
+
+class BinanceFuturesBookChangeMapper extends BinanceBookChangeMapper implements Mapper<'binance-futures' | 'binance-delivery', BookChange> {
+  protected mapBookDepthUpdate(binanceDepthUpdateData: BinanceFuturesDepthData, localTimestamp: Date): BookChange | undefined {
+    // we can safely assume here that depthContext and lastUpdateId aren't null here as this is method only works
+    // when we've already processed the snapshot
+    const depthContext = this.symbolToDepthInfoMapping[binanceDepthUpdateData.s]!
+    const lastUpdateId = depthContext.lastUpdateId!
+
+    // based on https://binanceapitest.github.io/Binance-Futures-API-doc/wss/#how-to-manage-a-local-order-book-correctly
+    // Drop any event where u is < lastUpdateId in the snapshot
+    if (binanceDepthUpdateData.u < lastUpdateId) {
+      return
+    }
+
+    // Binance documents a first update that contains the snapshot boundary. Live
+    // USD-M and COIN-M streams can instead continue it directly with pu == lastUpdateId.
+    // Both relations join the buffered stream to the snapshot without an update gap.
+    if (!depthContext.validatedFirstUpdate) {
+      const containsSnapshotBoundary = binanceDepthUpdateData.U <= lastUpdateId && binanceDepthUpdateData.u >= lastUpdateId
+      const continuesSnapshotDirectly = binanceDepthUpdateData.pu === lastUpdateId
+
+      if (containsSnapshotBoundary || continuesSnapshotDirectly) {
+        depthContext.validatedFirstUpdate = true
+      } else {
+        const message = `Book depth snaphot has no overlap with first update, update ${JSON.stringify(
+          binanceDepthUpdateData
+        )}, lastUpdateId: ${lastUpdateId}, exchange ${this.exchange}`
+
+        if (this.ignoreBookSnapshotOverlapError) {
+          depthContext.validatedFirstUpdate = true
+          debug(message)
+        } else {
+          throw new Error(message)
+        }
+      }
+    }
+
+    return {
+      type: 'book_change',
+      symbol: binanceDepthUpdateData.s,
+      exchange: this.exchange,
+      isSnapshot: false,
+
+      bids: binanceDepthUpdateData.b.map(this.mapBookLevel),
+      asks: binanceDepthUpdateData.a.map(this.mapBookLevel),
+      timestamp: fromMicroSecondsToDate(binanceDepthUpdateData.E),
+      localTimestamp: localTimestamp
+    }
+  }
+}
+
+class BinanceFuturesDerivativeTickerMapper implements Mapper<'binance-futures' | 'binance-delivery', DerivativeTicker> {
+  private readonly pendingTickerInfoHelper = new PendingTickerInfoHelper()
+  private readonly _indexPrices = new Map<string, number>()
+
+  constructor(protected readonly exchange: Exchange) {}
+
+  canHandle(message: BinanceResponse<any>) {
+    if (message.stream === undefined) {
+      return false
+    }
+
+    return (
+      message.stream.includes('@markPrice') ||
+      message.stream.endsWith('@ticker') ||
+      message.stream.endsWith('@openInterest') ||
+      message.stream.includes('@indexPrice')
+    )
+  }
+
+  getFilters(symbols?: string[]): FilterForExchange['binance-futures' | 'binance-delivery'][] {
+    symbols = lowerCaseSymbols(symbols)
+
+    const filters = [
+      {
+        channel: 'markPrice',
+        symbols
+      } as const,
+      {
+        channel: 'ticker',
+        symbols
+      } as const,
+      {
+        channel: 'openInterest',
+        symbols
+      } as const
+    ]
+
+    if (this.exchange === 'binance-delivery') {
+      // index channel requires index symbol
+      filters.push({
+        channel: 'indexPrice' as any,
+        symbols: symbols !== undefined ? symbols.map((s) => s.split('_')[0]) : undefined
+      })
+    }
+
+    return filters
+  }
+
+  *map(
+    message: BinanceResponse<
+      BinanceFuturesMarkPriceData | BinanceFuturesTickerData | BinanceFuturesOpenInterestData | BinanceFuturesIndexPriceData
+    >,
+    localTimestamp: Date
+  ): IterableIterator<DerivativeTicker> {
+    if (message.data.e === 'indexPriceUpdate') {
+      this._indexPrices.set(message.data.i, Number(message.data.p))
+    } else {
+      const symbol = 's' in message.data ? message.data.s : message.data.symbol
+      const pendingTickerInfo = this.pendingTickerInfoHelper.getPendingTickerInfo(symbol, this.exchange)
+
+      const lastIndexPrice = this._indexPrices.get(symbol.split('_')[0])
+      if (lastIndexPrice !== undefined) {
+        pendingTickerInfo.updateIndexPrice(lastIndexPrice)
+      }
+
+      if (message.data.e === 'markPriceUpdate') {
+        if ('r' in message.data && message.data.r !== '' && message.data.T !== 0) {
+          // only perpetual futures have funding rate info in mark price
+          // delivery futures sometimes send empty ('') r value
+          pendingTickerInfo.updateFundingRate(Number(message.data.r))
+          pendingTickerInfo.updateFundingTimestamp(new Date(message.data.T!))
+        }
+        if (message.data.i !== undefined) {
+          pendingTickerInfo.updateIndexPrice(Number(message.data.i))
+        }
+
+        pendingTickerInfo.updateMarkPrice(Number(message.data.p))
+        pendingTickerInfo.updateTimestamp(fromMicroSecondsToDate(message.data.E))
+      }
+
+      if (message.data.e === '24hrTicker') {
+        pendingTickerInfo.updateLastPrice(Number(message.data.c))
+        pendingTickerInfo.updateTimestamp(fromMicroSecondsToDate(message.data.E))
+      }
+
+      if ('openInterest' in message.data) {
+        pendingTickerInfo.updateOpenInterest(Number(message.data.openInterest))
+      }
+
+      if (pendingTickerInfo.hasChanged()) {
+        yield pendingTickerInfo.getSnapshot(localTimestamp)
+      }
+    }
+  }
+}
+
+class BinanceLiquidationsMapper implements Mapper<'binance-futures' | 'binance-delivery', Liquidation> {
+  constructor(private readonly _exchange: Exchange) {}
+
+  canHandle(message: BinanceResponse<any>) {
+    if (message.stream === undefined) {
+      return false
+    }
+
+    return message.stream.endsWith('@forceOrder')
+  }
+
+  getFilters(symbols?: string[]) {
+    symbols = lowerCaseSymbols(symbols)
+
+    return [
+      {
+        channel: 'forceOrder',
+        symbols
+      } as const
+    ]
+  }
+
+  *map(binanceTradeResponse: BinanceResponse<BinanceFuturesForceOrderData>, localTimestamp: Date) {
+    const binanceLiquidation = binanceTradeResponse.data.o
+    // not sure if order status can be different to 'FILLED' for liquidations in practice, but...
+    if (binanceLiquidation.X !== 'FILLED') {
+      return
+    }
+
+    const liquidation: Liquidation = {
+      type: 'liquidation',
+      symbol: binanceLiquidation.s,
+      exchange: this._exchange,
+      id: undefined,
+      price: Number(binanceLiquidation.p),
+      amount: Number(binanceLiquidation.z), //   Order Filled Accumulated Quantity
+      side: binanceLiquidation.S === 'SELL' ? 'sell' : 'buy',
+      timestamp: fromMicroSecondsToDate(binanceLiquidation.T),
+      localTimestamp: localTimestamp
+    }
+
+    yield liquidation
+  }
+}
+
+class BinanceBookTickerMapper implements Mapper<'binance-futures' | 'binance-delivery' | 'binance', BookTicker> {
+  constructor(private readonly _exchange: Exchange) {}
+
+  canHandle(message: BinanceResponse<any>) {
+    if (message.stream === undefined) {
+      return false
+    }
+
+    return message.stream.endsWith('@bookTicker')
+  }
+
+  getFilters(symbols?: string[]) {
+    symbols = lowerCaseSymbols(symbols)
+
+    return [
+      {
+        channel: 'bookTicker',
+        symbols
+      } as const
+    ]
+  }
+
+  *map(binanceBookTickerResponse: BinanceResponse<BinanceBookTickerData>, localTimestamp: Date) {
+    const binanceBookTicker = binanceBookTickerResponse.data
+
+    const ticker: BookTicker = {
+      type: 'book_ticker',
+      symbol: binanceBookTicker.s,
+      exchange: this._exchange,
+      askAmount: binanceBookTicker.A !== undefined ? Number(binanceBookTicker.A) : undefined,
+      askPrice: binanceBookTicker.a !== undefined ? Number(binanceBookTicker.a) : undefined,
+      bidPrice: binanceBookTicker.b !== undefined ? Number(binanceBookTicker.b) : undefined,
+      bidAmount: binanceBookTicker.B !== undefined ? Number(binanceBookTicker.B) : undefined,
+      timestamp: binanceBookTicker.E !== undefined ? fromMicroSecondsToDate(binanceBookTicker.E) : localTimestamp,
+      localTimestamp: localTimestamp
+    }
+
+    yield ticker
+  }
+}
+
+type BinanceResponse<T> = {
+  stream: string
+  data: T
+}
+
+type BinanceTradeData = {
+  s: string
+  t: number
+  p: string
+  q: string
+  T: number
+  m: true
+  X?: 'INSURANCE_FUND' | 'MARKET' | 'ADL' | 'NA'
+}
+
+type BinanceBookLevel = [string, string]
+
+type BinanceDepthData = {
+  lastUpdateId: undefined
+  E: number
+  s: string
+  U: number
+  u: number
+  b: BinanceBookLevel[]
+  a: BinanceBookLevel[]
+}
+
+// T is the time that updated in matching engine, while E is when pushing out from ws server
+
+type BinanceFuturesDepthData = BinanceDepthData & {
+  pu: number
+  T: number
+}
+
+type BinanceDepthSnapshotData = {
+  lastUpdateId: number
+  bids: BinanceBookLevel[]
+  asks: BinanceBookLevel[]
+  T?: number
+}
+
+type LocalDepthInfo = {
+  bufferedUpdates: CircularBuffer<BinanceDepthData>
+  snapshotProcessed?: boolean
+  lastUpdateId?: number
+  validatedFirstUpdate?: boolean
+}
+
+type BinanceFuturesMarkPriceData = {
+  e: 'markPriceUpdate'
+  s: string // Symbol
+  E: number // Event time
+  p: string // Mark price
+  r?: string // Funding rate
+  T?: number // Next funding time
+  i?: string
+}
+
+type BinanceFuturesTickerData = {
+  e: '24hrTicker'
+  E: number // Event time
+  s: string // Symbol
+  c: string // Last price
+}
+
+type BinanceFuturesOpenInterestData = {
+  e: undefined
+  symbol: string
+  openInterest: string
+}
+
+type BinanceFuturesIndexPriceData = {
+  e: 'indexPriceUpdate' // Event type
+  E: 1591261236000 // Event time
+  i: string // Pair
+  p: string // Index Price
+}
+
+type BinanceFuturesForceOrderData = {
+  o: {
+    s: string // Symbol
+    S: string // Side
+    q: string // Original Quantity
+    p: string // Price
+    ap: string // Average Price
+    X: 'FILLED' // Order Status
+    l: '0.014' // Order Last Filled Quantity
+    T: 1568014460893 // Order Trade Time
+    z: string // Order Filled Accumulated Quantity
+  }
+}
+
+type BinanceBookTickerData = {
+  u: number // order book updateId
+  s: string // symbol
+  b: string // best bid price
+  B: string // best bid qty
+  a: string // best ask price
+  A: string // best ask qty
+  E?: number // transaction time
+}

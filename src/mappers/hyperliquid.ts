@@ -1,0 +1,270 @@
+import { BookChange, BookTicker, DerivativeTicker, Trade } from '../types.ts'
+import { Mapper, PendingTickerInfoHelper } from './mapper.ts'
+import { exchangeMappers, mapper } from './registry.ts'
+
+const HYPERLIQUID_FAST_BOOK_SWITCH_DATE = new Date('2026-06-17T00:00:00.000Z')
+// recorded live trades arrive within seconds of their block time (at most 13 s in sampled days of 2024-2026)
+const HYPERLIQUID_MAX_LIVE_TRADE_DELAY_MS = 30 * 1000
+
+export const hyperliquidMappers = exchangeMappers({
+  hyperliquid: {
+    trades: () => new HyperliquidTradesMapper(),
+    bookChanges: mapper([
+      { until: HYPERLIQUID_FAST_BOOK_SWITCH_DATE, use: () => new HyperliquidBookChangeMapper('l2Book') },
+      { use: () => new HyperliquidBookChangeMapper('fastBook') }
+    ]),
+    derivativeTickers: () => new HyperliquidDerivativeTickerMapper(),
+    bookTickers: () => new HyperliquidBookTickerMapper()
+  }
+})
+
+const KILO_SYMBOLS = ['kPEPE', 'kSHIB', 'kBONK', 'kFLOKI', 'kLUNC', 'kDOGS', 'kNEIRO']
+
+function getApiSymbolId(symbol: string) {
+  const potentialKSymbol = symbol.charAt(0).toLowerCase() + symbol.slice(1)
+  if (KILO_SYMBOLS.includes(potentialKSymbol)) {
+    return potentialKSymbol
+  }
+
+  if (symbol.includes(':')) {
+    const [prefix, suffix] = symbol.split(':')
+    return prefix.toLowerCase() + ':' + suffix
+  }
+
+  return symbol
+}
+function getSymbols(symbols?: string[]) {
+  if (symbols !== undefined) {
+    return symbols.map(getApiSymbolId)
+  }
+  return
+}
+class HyperliquidTradesMapper implements Mapper<'hyperliquid', Trade> {
+  canHandle(message: HyperliquidTradeMessage) {
+    return message.channel === 'trades'
+  }
+
+  getFilters(symbols?: string[]) {
+    symbols = getSymbols(symbols)
+
+    return [
+      {
+        channel: 'trades',
+        symbols
+      }
+    ]
+  }
+
+  *map(message: HyperliquidTradeMessage, localTimestamp: Date): IterableIterator<Trade> {
+    // A live message carries the trades of one block, which share one time. After subscribing, Hyperliquid
+    // sends the most recent trades as one message. That recent-trades snapshot is skipped: it has different
+    // trade times, or, when its trades come from one block, that block is older than any live trade.
+    const firstTradeTime = message.data[0]?.time
+    const isRecentTradesSnapshot =
+      message.data.some((hyperliquidTrade) => hyperliquidTrade.time !== firstTradeTime) ||
+      localTimestamp.valueOf() - firstTradeTime > HYPERLIQUID_MAX_LIVE_TRADE_DELAY_MS
+
+    if (isRecentTradesSnapshot) {
+      return
+    }
+
+    for (const hyperliquidTrade of message.data) {
+      yield {
+        type: 'trade',
+        symbol: hyperliquidTrade.coin.toUpperCase(),
+        exchange: 'hyperliquid',
+        id: hyperliquidTrade.tid.toString(),
+        price: Number(hyperliquidTrade.px),
+        amount: Number(hyperliquidTrade.sz),
+        side: hyperliquidTrade.side === 'B' ? 'buy' : 'sell',
+        timestamp: new Date(hyperliquidTrade.time),
+        localTimestamp: localTimestamp
+      }
+    }
+  }
+}
+
+function mapHyperliquidLevel(level: HyperliquidWsLevel) {
+  return {
+    price: Number(level.px),
+    amount: Number(level.sz)
+  }
+}
+class HyperliquidBookChangeMapper implements Mapper<'hyperliquid', BookChange> {
+  constructor(private readonly filterChannel: HyperliquidBookChannel) {}
+
+  canHandle(message: HyperliquidWsBookMessage) {
+    // Hyperliquid returns channel=l2Book for both live feeds and marks only the fast feed with data.fast=true.
+    // The recorder rewrites that channel to fastBook so historical data can distinguish the two feeds.
+    const isFastBook = message.channel === 'fastBook' || (message.channel === 'l2Book' && message.data.fast === true)
+
+    return this.filterChannel === 'fastBook' ? isFastBook : message.channel === 'l2Book' && isFastBook === false
+  }
+
+  getFilters(symbols?: string[]) {
+    symbols = getSymbols(symbols)
+
+    return [
+      {
+        channel: this.filterChannel,
+        symbols
+      }
+    ]
+  }
+
+  *map(message: HyperliquidWsBookMessage, localTimestamp: Date): IterableIterator<BookChange> {
+    yield {
+      type: 'book_change',
+      symbol: message.data.coin.toUpperCase(),
+      exchange: 'hyperliquid',
+      isSnapshot: true,
+      bids: (message.data.levels[0] ? message.data.levels[0] : []).map(mapHyperliquidLevel),
+      asks: (message.data.levels[1] ? message.data.levels[1] : []).map(mapHyperliquidLevel),
+      timestamp: new Date(message.data.time),
+      localTimestamp
+    }
+  }
+}
+
+class HyperliquidBookTickerMapper implements Mapper<'hyperliquid', BookTicker> {
+  canHandle(message: HyperliquidBboMessage) {
+    return message.channel === 'bbo'
+  }
+
+  getFilters(symbols?: string[]) {
+    symbols = getSymbols(symbols)
+
+    return [
+      {
+        channel: 'bbo',
+        symbols
+      }
+    ]
+  }
+
+  *map(message: HyperliquidBboMessage, localTimestamp: Date): IterableIterator<BookTicker> {
+    const bbo = message.data.bbo
+    const bestBid = bbo[0]
+    const bestAsk = bbo[1]
+
+    const ticker: BookTicker = {
+      type: 'book_ticker',
+      symbol: message.data.coin.toUpperCase(),
+      exchange: 'hyperliquid',
+      bidPrice: bestBid ? Number(bestBid.px) : undefined,
+      bidAmount: bestBid ? Number(bestBid.sz) : undefined,
+      askPrice: bestAsk ? Number(bestAsk.px) : undefined,
+      askAmount: bestAsk ? Number(bestAsk.sz) : undefined,
+      timestamp: new Date(message.data.time),
+      localTimestamp: localTimestamp
+    }
+
+    yield ticker
+  }
+}
+
+class HyperliquidDerivativeTickerMapper implements Mapper<'hyperliquid', DerivativeTicker> {
+  private readonly pendingTickerInfoHelper = new PendingTickerInfoHelper()
+
+  canHandle(message: HyperliquidContextMessage) {
+    return message.channel === 'activeAssetCtx'
+  }
+
+  getFilters(symbols?: string[]) {
+    symbols = getSymbols(symbols)
+
+    return [
+      {
+        channel: 'activeAssetCtx',
+        symbols
+      }
+    ]
+  }
+
+  *map(message: HyperliquidContextMessage, localTimestamp: Date): IterableIterator<DerivativeTicker> {
+    const symbol = message.data.coin.toUpperCase()
+
+    const pendingTickerInfo = this.pendingTickerInfoHelper.getPendingTickerInfo(symbol, 'hyperliquid')
+
+    if (message.data.ctx.funding !== undefined) {
+      pendingTickerInfo.updateFundingRate(Number(message.data.ctx.funding))
+    }
+
+    if (message.data.ctx.markPx !== undefined) {
+      pendingTickerInfo.updateMarkPrice(Number(message.data.ctx.markPx))
+    }
+
+    if (message.data.ctx.openInterest !== undefined) {
+      pendingTickerInfo.updateOpenInterest(Number(message.data.ctx.openInterest))
+    }
+
+    if (message.data.ctx.oraclePx !== undefined) {
+      pendingTickerInfo.updateIndexPrice(Number(message.data.ctx.oraclePx))
+    }
+
+    if (pendingTickerInfo.hasChanged()) {
+      pendingTickerInfo.updateTimestamp(localTimestamp)
+      yield pendingTickerInfo.getSnapshot(localTimestamp)
+    }
+  }
+}
+
+type HyperliquidTradeMessage = {
+  channel: 'trades'
+  data: [
+    {
+      coin: string
+      side: string
+      px: string
+      sz: string
+      hash: string
+      time: number
+      tid: number // ID unique across all assets
+    }
+  ]
+}
+
+type HyperliquidWsBookMessage = {
+  channel: HyperliquidBookChannel
+  data: {
+    coin: 'ATOM'
+    time: 1730160007687
+    levels: [HyperliquidWsLevel[], HyperliquidWsLevel[]]
+    fast?: boolean
+  }
+}
+
+type HyperliquidBookChannel = 'l2Book' | 'fastBook'
+
+type HyperliquidWsLevel = {
+  px: string // price
+  sz: string // size
+  n: number // number of orders
+}
+
+type HyperliquidBboMessage = {
+  channel: 'bbo'
+  data: {
+    coin: string
+    time: number
+    bbo: [HyperliquidWsLevel, HyperliquidWsLevel]
+  }
+}
+
+type HyperliquidContextMessage = {
+  channel: 'activeAssetCtx'
+  data: {
+    coin: 'RENDER'
+    ctx: {
+      funding: '0.0000125'
+      openInterest: '231067.2'
+      prevDayPx: '4.8744'
+      dayNtlVlm: '387891.57092'
+      premium: '0.0'
+      oraclePx: '4.9185'
+      markPx: '4.919'
+      midPx: '4.9183'
+      impactPxs: ['4.9176', '4.9191']
+    }
+  }
+}

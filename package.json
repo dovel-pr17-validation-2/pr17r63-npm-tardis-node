@@ -1,0 +1,81 @@
+{
+  "name": "tardis-dev",
+  "version": "18.8.2",
+  "engines": {
+    "node": "^24.22.1 || >=26.12.1"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "^24.22.1 || >=26.12.1"
+    },
+    "packageManager": {
+      "name": "npm",
+      "version": ">=11.17.0"
+    }
+  },
+  "description": "Convenient access to tick-level historical and real-time cryptocurrency market data via Node.js",
+  "main": "dist/index.js",
+  "source": "src/index.ts",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "repository": "tardis-dev/tardis-node",
+  "homepage": "https://docs.tardis.dev/api/node-js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && tsc -p test/tsconfig.json && node --experimental-test-module-mocks --test --test-concurrency=4 test/*.test.ts",
+    "test:update-snapshots": "npm run build && tsc -p test/tsconfig.json && node --experimental-test-module-mocks --test --test-concurrency=4 --test-update-snapshots test/*.test.ts",
+    "prepare": "npm run build",
+    "format": "prettier --write .",
+    "check-format": "prettier --check ."
+  },
+  "files": [
+    "src",
+    "dist",
+    "example.js"
+  ],
+  "keywords": [
+    "cryptocurrency data feed",
+    "market data",
+    "api client",
+    "crypto markets data replay",
+    "historical data",
+    "real-time cryptocurrency market data feed",
+    "historical cryptocurrency prices",
+    "cryptocurrency api",
+    "real-time normalized WebSocket cryptocurrency markets data",
+    "normalized cryptocurrency market data API",
+    "order book reconstruction",
+    "market data normalization",
+    "cryptocurrency api",
+    "cryptocurrency",
+    "orderbook",
+    "exchange",
+    "websocket",
+    "realtime",
+    "bitmex",
+    "binance",
+    "trading",
+    "high granularity order book data"
+  ],
+  "license": "MPL-2.0",
+  "dependencies": {
+    "debug": "^4.4.3",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/ws": "^8.18.1",
+    "prettier": "3.9.6",
+    "typescript": "^6.0.3"
+  },
+  "runkitExampleFilename": "example.js"
+}
